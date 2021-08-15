@@ -104,7 +104,7 @@ struct Router2
     std::vector<NetInfo *> nets_by_udata;
     std::vector<PerNetData> nets;
 
-    bool timing_driven;
+    bool timing_driven, timing_driven_ripup;
     TimingAnalyser tmg;
 
     void setup_nets()
@@ -574,8 +574,10 @@ struct Router2
         return tmg.get_criticality(CellPortKey(net->users.at(i)));
     }
 
-    bool arc_failed_slack(NetInfo *net, size_t usr_idx) {
-        return timing_driven && (tmg.get_setup_slack(CellPortKey(net->users.at(usr_idx))) < 0);
+    bool arc_failed_slack(NetInfo *net, size_t usr_idx)
+    {
+        return timing_driven_ripup &&
+               (tmg.get_setup_slack(CellPortKey(net->users.at(usr_idx))) < (2 * ctx->getDelayEpsilon()));
     }
 
     ArcRouteResult route_arc(ThreadContext &t, NetInfo *net, size_t i, size_t phys_pin, bool is_mt, bool is_bb = true)
@@ -608,7 +610,7 @@ struct Router2
         //     0. starting within a small range of existing routing
         //     1. expanding from all routing
         int mode = 0;
-        if (net->users.size() < 4 || nd.wires.empty())
+        if (net->users.size() < 4 || nd.wires.empty() || (crit > 0.95))
             mode = 1;
 
         // This records the point where forwards and backwards routing met
@@ -871,12 +873,15 @@ struct Router2
         t.wire_by_loc.clear();
         t.in_wire_by_loc.clear();
         auto &nd = nets.at(net->udata);
+        bool failed_slack = false;
+        for (size_t i = 0; i < net->users.size(); i++)
+            failed_slack |= arc_failed_slack(net, i);
         for (size_t i = 0; i < net->users.size(); i++) {
             auto &ad = nd.arcs.at(i);
             for (size_t j = 0; j < ad.size(); j++) {
                 // Ripup failed arcs to start with
                 // Check if arc is already legally routed
-                if (check_arc_routing(net, i, j) && !arc_failed_slack(net, i)) {
+                if (!failed_slack && check_arc_routing(net, i, j)) {
                     update_wire_by_loc(t, net, i, j, true);
                     continue;
                 }
@@ -1362,6 +1367,10 @@ struct Router2
             route_queue.push_back(i);
 
         timing_driven = ctx->setting<bool>("timing_driven");
+        if (ctx->settings.count(ctx->id("router2/tmg_ripup")))
+            timing_driven_ripup = timing_driven && ctx->setting<bool>("router2/tmg_ripup");
+        else
+            timing_driven_ripup = false;
         log_info("Running main router loop...\n");
         if (timing_driven)
             tmg.run(true);
@@ -1369,8 +1378,6 @@ struct Router2
             ctx->sorted_shuffle(route_queue);
 
             if (timing_driven) {
-                // Heuristic: reduce runtime by skipping STA in the case of a "long tail" of a few
-                // congested nodes
                 for (auto n : route_queue) {
                     NetInfo *ni = nets_by_udata.at(n);
                     auto &net = nets.at(n);
@@ -1398,8 +1405,9 @@ struct Router2
                 log_info("        wrote wiretype heatmap to %s.\n", filename.c_str());
             }
             int tmgfail = 0;
-            if (timing_driven && overused_wires > 0) {
+            if (timing_driven)
                 tmg.run(false);
+            if (timing_driven_ripup) {
                 for (size_t i = 0; i < nets_by_udata.size(); i++) {
                     NetInfo *ni = nets_by_udata.at(i);
                     for (size_t j = 0; j < ni->users.size(); j++) {
@@ -1416,8 +1424,14 @@ struct Router2
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
-            log_info("    iter=%d wires=%d overused=%d overuse=%d tmgfail=%d archfail=%s\n", iter, total_wire_use, overused_wires,
-                     total_overuse, tmgfail, (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
+            if (timing_driven_ripup)
+                log_info("    iter=%d wires=%d overused=%d overuse=%d tmgfail=%d archfail=%s\n", iter, total_wire_use,
+                         overused_wires, total_overuse, tmgfail,
+                         (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
+            else
+                log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use,
+                         overused_wires, total_overuse,
+                         (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
             ++iter;
             if (curr_cong_weight < 1e9)
                 curr_cong_weight += cfg.curr_cong_mult;
