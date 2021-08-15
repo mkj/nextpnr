@@ -358,7 +358,7 @@ struct Router2
         float base_cost = ctx->getDelayNS(ctx->getPipDelay(pip).maxDelay() + ctx->getWireDelay(wire).maxDelay() +
                                           ctx->getDelayEpsilon());
         int overuse = wd.curr_cong;
-        float hist_cost = wd.hist_cong_cost;
+        float hist_cost = 1.0f + crit_weight * (wd.hist_cong_cost - 1.0f);
         float bias_cost = 0;
         int source_uses = 0;
         if (nd.wires.count(wire)) {
@@ -574,6 +574,10 @@ struct Router2
         return tmg.get_criticality(CellPortKey(net->users.at(i)));
     }
 
+    bool arc_failed_slack(NetInfo *net, size_t usr_idx) {
+        return timing_driven && (tmg.get_setup_slack(CellPortKey(net->users.at(usr_idx))) < 0);
+    }
+
     ArcRouteResult route_arc(ThreadContext &t, NetInfo *net, size_t i, size_t phys_pin, bool is_mt, bool is_bb = true)
     {
         // Do some initial lookups and checks
@@ -595,6 +599,7 @@ struct Router2
         // Calculate a timing weight based on criticality
         float crit = get_arc_crit(net, i);
         float crit_weight = (1.0f - std::pow(crit, 2));
+        ROUTE_LOG_DBG("     crit=%.3f crit_weight=%.3f\n", crit, crit_weight);
         // Check if arc was already done _in this iteration_
         if (t.processed_sinks.count(dst_wire))
             return ARC_SUCCESS;
@@ -871,7 +876,7 @@ struct Router2
             for (size_t j = 0; j < ad.size(); j++) {
                 // Ripup failed arcs to start with
                 // Check if arc is already legally routed
-                if (check_arc_routing(net, i, j)) {
+                if (check_arc_routing(net, i, j) && !arc_failed_slack(net, i)) {
                     update_wire_by_loc(t, net, i, j, true);
                     continue;
                 }
@@ -1358,13 +1363,14 @@ struct Router2
 
         timing_driven = ctx->setting<bool>("timing_driven");
         log_info("Running main router loop...\n");
+        if (timing_driven)
+            tmg.run(true);
         do {
             ctx->sorted_shuffle(route_queue);
 
-            if (timing_driven && (int(route_queue.size()) > (int(nets_by_udata.size()) / 500))) {
+            if (timing_driven) {
                 // Heuristic: reduce runtime by skipping STA in the case of a "long tail" of a few
                 // congested nodes
-                tmg.run(iter == 1);
                 for (auto n : route_queue) {
                     NetInfo *ni = nets_by_udata.at(n);
                     auto &net = nets.at(n);
@@ -1391,15 +1397,27 @@ struct Router2
                 write_wiretype_heatmap(cong_map);
                 log_info("        wrote wiretype heatmap to %s.\n", filename.c_str());
             }
-
-            if (overused_wires == 0) {
+            int tmgfail = 0;
+            if (timing_driven && overused_wires > 0) {
+                tmg.run(false);
+                for (size_t i = 0; i < nets_by_udata.size(); i++) {
+                    NetInfo *ni = nets_by_udata.at(i);
+                    for (size_t j = 0; j < ni->users.size(); j++) {
+                        if (arc_failed_slack(ni, j)) {
+                            failed_nets.insert(i);
+                            ++tmgfail;
+                        }
+                    }
+                }
+            }
+            if (overused_wires == 0 && tmgfail == 0) {
                 // Try and actually bind nextpnr Arch API wires
                 bind_and_check_all();
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
-            log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use, overused_wires,
-                     total_overuse, overused_wires > 0 ? "NA" : std::to_string(arch_fail).c_str());
+            log_info("    iter=%d wires=%d overused=%d overuse=%d tmgfail=%d archfail=%s\n", iter, total_wire_use, overused_wires,
+                     total_overuse, tmgfail, (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
             ++iter;
             if (curr_cong_weight < 1e9)
                 curr_cong_weight += cfg.curr_cong_mult;
