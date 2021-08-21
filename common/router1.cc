@@ -837,6 +837,8 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                 last_arcs_with_ripup = router.arcs_with_ripup;
                 last_arcs_without_ripup = router.arcs_without_ripup;
                 ctx->yield();
+                ctx->base_pip2net.sort();
+                ctx->base_wire2net.sort();
 #ifndef NDEBUG
                 router.check();
 #endif
