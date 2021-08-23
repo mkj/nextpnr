@@ -52,6 +52,20 @@ enum ConstIds
 
 NPNR_PACKED_STRUCT(struct LocationPOD { int16_t x, y; });
 
+static uint32_t interleave(uint16_t in)
+{
+    // From http://www-graphics.stanford.edu/~seander/bithacks.html#InterleaveBMN
+    const unsigned int B[] = {0x55555555, 0x33333333, 0x0F0F0F0F, 0x00FF00FF};
+    const unsigned int S[] = {1, 2, 4, 8};
+    uint32_t x = in;
+
+    x = (x | (x << S[3])) & B[3];
+    x = (x | (x << S[2])) & B[2];
+    x = (x | (x << S[1])) & B[1];
+    x = (x | (x << S[0])) & B[0];
+    return x;
+}
+
 struct Location
 {
     int16_t x = -1, y = -1;
@@ -61,8 +75,12 @@ struct Location
 
     bool operator==(const Location &other) const { return x == other.x && y == other.y; }
     bool operator!=(const Location &other) const { return x != other.x || y != other.y; }
-    bool operator<(const Location &other) const { return y == other.y ? x < other.x : y < other.y; }
+    bool operator<(const Location &other) const { return z_order() < other.z_order(); }
     unsigned int hash() const { return mkhash(x, y); }
+    uint32_t z_order() const
+    {
+        return (interleave(x - INT16_MIN) << 1 ) | interleave(y - INT16_MIN);
+    }
 };
 
 inline Location operator+(const Location &a, const Location &b) { return Location(a.x + b.x, a.y + b.y); }
